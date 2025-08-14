@@ -1,1 +1,1 @@
-bale-python
+python-bale-bot
