@@ -92,8 +92,21 @@ async def scheduled_sender():
                 except Exception as e:
                     print(f"❌ خطا در ارسال محتوا: {e}")
         await asyncio.sleep(30)  # فاصله ۵ ثانیه‌ای
+        
+import threading
+import http.server
+import socketserver
+
+def fake_server():
+    PORT = 8080
+    Handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        httpd.serve_forever()
+
+threading.Thread(target=fake_server, daemon=True).start()
 
 if __name__ == "__main__":
     print("🤖 ربات در حال اجرا و فقط به @heroderact پاسخ می‌دهد...")
     bot.run()
+
 
