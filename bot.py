@@ -67,7 +67,7 @@ async def process_queue():
             await safe_send(user_id, "⚠️ خطا در ارسال رسانه.")
 
         # ⏳ تأخیر ۵۰ ثانیه‌ای بین هر ارسال
-        await asyncio.sleep(50)
+        await asyncio.sleep(20 * 60)
 
 # راه‌اندازی سرور جعلی برای جلوگیری از قطع شدن ربات در برخی هاست‌ها
 import threading
