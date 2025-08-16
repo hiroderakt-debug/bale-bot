@@ -16,7 +16,7 @@ edit_mode = {}  # user_id -> message_id در حال ویرایش
 
 bot = Bot(token="347447058:s19i9J3UPZLUrprUqrH12UYD1lDGcPPi1ulV9iFL")
 send_queue = asyncio.Queue()
-scheduled_queue = deque()
+scheduled_queue = deque()  # هر آیتم: (message, scheduled_time, caption)
 
 # وب‌سرور FastAPI
 app = FastAPI()
@@ -57,10 +57,9 @@ async def on_message(message: Message):
     # حالت ویرایش متن
     if user_id in edit_mode:
         target_id = edit_mode[user_id]
-        for i, (msg, time) in enumerate(scheduled_queue):
+        for i, (msg, time, caption) in enumerate(scheduled_queue):
             if msg.message_id == target_id:
-                msg.content = content
-                scheduled_queue[i] = (msg, time)
+                scheduled_queue[i] = (msg, time, content)
                 await safe_send(user_id, "✏️ متن پیام با موفقیت ویرایش شد.")
                 del edit_mode[user_id]
                 return
@@ -83,21 +82,17 @@ async def on_message(message: Message):
     # لغو پیام
     if message.reply_to_message and content.lower() == "لغو":
         reply_id = message.reply_to_message.message_id
-        for original_msg, _ in scheduled_queue:
-            if original_msg.message_id == reply_id:
-                scheduled_queue = deque([
-                    (msg, time) for msg, time in scheduled_queue if msg.message_id != reply_id
-                ])
-                await safe_send(user_id, "❌ پیام با موفقیت لغو شد.")
-                return
-        await safe_send(user_id, "⚠️ این پیام در صف نبود یا قبلاً ارسال شده.")
+        scheduled_queue = deque([
+            (msg, time, caption) for msg, time, caption in scheduled_queue if msg.message_id != reply_id
+        ])
+        await safe_send(user_id, "❌ پیام با موفقیت لغو شد.")
         return
 
     # نمایش زمان باقی‌مانده
     if message.reply_to_message and content.lower() == "زمان":
         reply_id = message.reply_to_message.message_id
-        for original_msg, scheduled_time in scheduled_queue:
-            if original_msg.message_id == reply_id:
+        for msg, scheduled_time, _ in scheduled_queue:
+            if msg.message_id == reply_id:
                 remaining = scheduled_time - datetime.now()
                 if remaining.total_seconds() > 0:
                     await safe_send(user_id, format_remaining_time(remaining))
@@ -129,8 +124,8 @@ async def on_message(message: Message):
     # ویرایش متن پیام
     if message.reply_to_message and content.lower() == "ویرایش":
         reply_id = message.reply_to_message.message_id
-        for original_msg, _ in scheduled_queue:
-            if original_msg.message_id == reply_id:
+        for msg, _, _ in scheduled_queue:
+            if msg.message_id == reply_id:
                 edit_mode[user_id] = reply_id
                 await safe_send(user_id, "📝 لطفاً متن جدید را ارسال کنید.")
                 return
@@ -144,7 +139,7 @@ async def on_message(message: Message):
     else:
         scheduled_time = datetime.now() + timedelta(minutes=delay_minutes)
 
-    scheduled_queue.append((message, scheduled_time))
+    scheduled_queue.append((message, scheduled_time, content))
     await send_queue.put(message)
 
 async def process_queue():
@@ -157,12 +152,14 @@ async def process_queue():
             await asyncio.sleep(5)
 
         user_id = message.author.user_id
-        caption = message.content or ""
 
+        # پیدا کردن caption مربوط به پیام
+        caption = ""
         scheduled_time = None
-        for msg, time in scheduled_queue:
+        for msg, time, cap in scheduled_queue:
             if msg.message_id == message.message_id:
                 scheduled_time = time
+                caption = cap
                 break
 
         if scheduled_time:
@@ -199,7 +196,7 @@ async def process_queue():
             await safe_send(user_id, "⚠️ خطا در ارسال رسانه.")
 
         scheduled_queue = deque([
-            (msg, time) for msg, time in scheduled_queue if msg.message_id != message.message_id
+            (msg, time, cap) for msg, time, cap in scheduled_queue if msg.message_id != message.message_id
         ])
 
 def format_remaining_time(remaining: timedelta) -> str:
@@ -225,7 +222,7 @@ async def log_remaining_times():
     while True:
         print("📋 وضعیت صف ارسال:")
         now = datetime.now()
-        for msg, scheduled_time in scheduled_queue:
+        for msg, scheduled_time, _ in scheduled_queue:
             remaining = scheduled_time - now
             if remaining.total_seconds() <= 0:
                 print(f"✅ پیام {msg.message_id} آماده ارسال است.")
@@ -241,7 +238,7 @@ async def keep_alive():
                     print(f"🔄 پینگ داخلی: {resp.status}")
         except Exception as e:
             print(f"⚠️ خطا در پینگ داخلی: {e}")
-        await asyncio.sleep(60)
+                await asyncio.sleep(60)
 
 if __name__ == "__main__":
     print("🤖 ربات در حال اجرا...")
