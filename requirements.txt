@@ -1,4 +1,4 @@
 python-bale-bot
+aiohttp
 fastapi
 uvicorn
-
