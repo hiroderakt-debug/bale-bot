@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+import os
 from datetime import datetime, timedelta
 from collections import deque
 from bale import Bot, Message, InputFile
@@ -37,7 +38,8 @@ def ping():
     return {"status": "ok"}
 
 def run_web_server():
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 def save_message_to_db(message: Message, scheduled_time: datetime):
     cursor.execute("""
@@ -154,7 +156,6 @@ async def process_queue():
 
         user_id = message.author.user_id
         caption = message.content or ""
-        media_sent = False
 
         scheduled_time = None
         for msg, time in scheduled_queue:
@@ -177,7 +178,6 @@ async def process_queue():
                 )
                 print(f"✅ ویدیو از کاربر {user_id} ارسال شد: {datetime.now()}")
                 await safe_send(user_id, "🎥 ویدیو با موفقیت ارسال شد.")
-                media_sent = True
 
             elif isinstance(message.photos, list) and len(message.photos) > 0:
                 for photo in message.photos:
@@ -188,7 +188,6 @@ async def process_queue():
                     )
                     print(f"✅ عکس از کاربر {user_id} ارسال شد: {datetime.now()}")
                     await safe_send(user_id, "🖼️ عکس با موفقیت ارسال شد.")
-                    media_sent = True
 
             else:
                 await safe_send(user_id, "⚠️ لطفاً فقط عکس یا ویدیو همراه با متن ارسال کنید.")
@@ -237,11 +236,6 @@ async def keep_alive():
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get("http://localhost:10000") as resp:
+                async with session.get("http://localhost:" + os.environ.get("PORT", "10000")) as resp:
                     print(f"🔄 پینگ داخلی: {resp.status}")
-        except Exception as e:
-            print(f"⚠️ خطا در پینگ داخلی: {e}")
-        await asyncio.sleep(60)
-
-if __name__ == "__main__":
-    print("
+        except Exception
