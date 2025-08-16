@@ -1,185 +1,111 @@
-import asyncio
-import json
-import os
 from datetime import datetime, timedelta
-from collections import deque
-from bale import Bot, Message, InputFile
-import bale.error
-import aiohttp
-from fastapi import FastAPI
-import uvicorn
-import threading
+import asyncio
 
-bot = Bot(token="347447058:s19i9J3UPZLUrprUqrH12UYD1lDGcPPi1ulV9iFL")
-send_queue = asyncio.Queue()
-scheduled_queue = deque()
+# صف زمان‌بندی پیام‌ها
+scheduled_queue = []
+delay_minutes = 20  # مقدار پیش‌فرض تأخیر بین ارسال‌ها
 
-# وب‌سرور FastAPI
-app = FastAPI()
-
-@app.get("/")
-def ping():
-    return {"status": "ok"}
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-async def safe_send(chat_id: int, text: str):
+# تابع ارسال امن
+async def safe_send(user_id, content):
     try:
-        await bot.send_message(chat_id=chat_id, text=text)
-    except bale.error.Forbidden:
-        print(f"❌ ارسال پیام به کاربر {chat_id} ممکن نیست.")
+        # اینجا تابع ارسال پیام به کاربر رو قرار بده
+        print(f"ارسال به {user_id}: {content}")
+    except Exception as e:
+        print(f"خطا در ارسال: {e}")
 
-@bot.event
-async def on_ready():
-    print("✅ ربات آماده است.")
-    asyncio.create_task(process_queue())
-    asyncio.create_task(log_remaining_times())
-    asyncio.create_task(keep_alive())
+# تابع اصلی دریافت پیام
+async def on_message(message):
+    global delay_minutes
 
-@bot.event
-async def on_message(message: Message):
-    global scheduled_queue
+    content = message.content.strip()
+    user_id = message.author.user_id
 
-    if getattr(message.chat, "type", None) != "private":
-        return
-    if message.author.username != "heroderact":
-        return
-
-    if message.reply_to_message and message.content.strip().lower() == "لغو":
-        reply_id = message.reply_to_message.message_id
-        for original_msg, _ in scheduled_queue:
-            if original_msg.message_id == reply_id:
-                scheduled_queue = deque([
-                    (msg, time) for msg, time in scheduled_queue if msg.message_id != reply_id
-                ])
-                await safe_send(message.author.user_id, "❌ پیام با موفقیت لغو شد و دیگر ارسال نمی‌شود.")
+    # تغییر زمان تأخیر
+    if content.startswith("تغییر زمان"):
+        try:
+            new_delay = int(content.split(" ")[-1])
+            if new_delay <= 0:
+                await safe_send(user_id, "⚠️ لطفاً عددی بزرگ‌تر از صفر وارد کنید.")
                 return
-        await safe_send(message.author.user_id, "⚠️ این پیام در صف نبود یا قبلاً ارسال شده.")
+            delay_minutes = new_delay
+            await safe_send(user_id, f"⏱️ زمان تأخیر بین ارسال‌ها به {new_delay} دقیقه تغییر کرد.")
+        except ValueError:
+            await safe_send(user_id, "⚠️ فرمت صحیح نیست. مثال: تغییر زمان 30")
         return
 
-    if message.reply_to_message and message.content.strip().lower() == "زمان":
-        reply_id = message.reply_to_message.message_id
-        for original_msg, scheduled_time in scheduled_queue:
-            if original_msg.message_id == reply_id:
-                remaining = scheduled_time - datetime.now()
-                if remaining.total_seconds() > 0:
-                    await safe_send(message.author.user_id, format_remaining_time(remaining))
-                else:
-                    await safe_send(message.author.user_id, "✅ این رسانه در حال ارسال یا ارسال شده است.")
+    # لغو همه پیام‌های زمان‌بندی‌شده
+    if content == "لغو":
+        scheduled_queue[:] = [item for item in scheduled_queue if item["user_id"] != user_id]
+        await safe_send(user_id, "❌ همه پیام‌های زمان‌بندی‌شده شما لغو شدند.")
+        return
+
+    # نمایش زمان پیام‌های زمان‌بندی‌شده
+    if content == "زمان":
+        user_messages = [item for item in scheduled_queue if item["user_id"] == user_id]
+        if not user_messages:
+            await safe_send(user_id, "⏳ هیچ پیام زمان‌بندی‌شده‌ای ندارید.")
+        else:
+            times = "\n".join([f"- {item['time'].strftime('%H:%M')} → {item['content']}" for item in user_messages])
+            await safe_send(user_id, f"🕒 پیام‌های زمان‌بندی‌شده:\n{times}")
+        return
+
+    # حذف آخرین پیام زمان‌بندی‌شده
+    if content == "حذف":
+        for i in range(len(scheduled_queue) - 1, -1, -1):
+            if scheduled_queue[i]["user_id"] == user_id:
+                removed = scheduled_queue.pop(i)
+                await safe_send(user_id, f"🗑️ پیام '{removed['content']}' حذف شد.")
                 return
-        await safe_send(message.author.user_id, "❌ این پیام در صف ارسال نیست یا قبلاً ارسال شده.")
+        await safe_send(user_id, "⚠️ پیام زمان‌بندی‌شده‌ای برای حذف وجود ندارد.")
         return
 
-    if message.content.strip().lower() == "حذف":
-        scheduled_queue.clear()
-        await safe_send(message.author.user_id, "🗑️ کل صف زمان‌بندی‌شده با موفقیت حذف شد.")
-        return
-
-    if scheduled_queue:
-        last_scheduled_time = scheduled_queue[-1][1]
-        scheduled_time = last_scheduled_time + timedelta(minutes=20)
+    # زمان‌بندی پیام جدید
+    user_messages = [item for item in scheduled_queue if item["user_id"] == user_id]
+    if user_messages:
+        last_scheduled_time = user_messages[-1]["time"]
+        scheduled_time = last_scheduled_time + timedelta(minutes=delay_minutes)
     else:
-        scheduled_time = datetime.now() + timedelta(minutes=20)
+        scheduled_time = datetime.now() + timedelta(minutes=delay_minutes)
 
-    scheduled_queue.append((message, scheduled_time))
-    await send_queue.put(message)
+    scheduled_queue.append({
+        "user_id": user_id,
+        "content": content,
+        "time": scheduled_time
+    })
 
-async def process_queue():
-    global scheduled_queue
+    await safe_send(user_id, f"✅ پیام شما برای ساعت {scheduled_time.strftime('%H:%M')} زمان‌بندی شد.")
 
+# حلقه بررسی ارسال پیام‌ها
+async def scheduler_loop():
     while True:
-        message = await send_queue.get()
-
-        user_id = message.author.user_id
-        caption = message.content or ""
-
-        scheduled_time = None
-        for msg, time in scheduled_queue:
-            if msg.message_id == message.message_id:
-                scheduled_time = time
-                break
-
-        if scheduled_time:
-            now = datetime.now()
-            wait_seconds = (scheduled_time - now).total_seconds()
-            if wait_seconds > 0:
-                await asyncio.sleep(wait_seconds)
-
-        try:
-            if isinstance(message.video, dict) and "file_id" in message.video:
-                await bot.send_video(
-                    chat_id="@hiromce",
-                    video=InputFile(message.video["file_id"]),
-                    caption=caption
-                )
-                print(f"✅ ویدیو از کاربر {user_id} ارسال شد: {datetime.now()}")
-                await safe_send(user_id, "🎥 ویدیو با موفقیت ارسال شد.")
-
-            elif isinstance(message.photos, list) and len(message.photos) > 0:
-                for photo in message.photos:
-                    await bot.send_photo(
-                        chat_id="@hiromce",
-                        photo=InputFile(photo.file_id),
-                        caption=caption
-                    )
-                    print(f"✅ عکس از کاربر {user_id} ارسال شد: {datetime.now()}")
-                    await safe_send(user_id, "🖼️ عکس با موفقیت ارسال شد.")
-
-            else:
-                await safe_send(user_id, "⚠️ لطفاً فقط عکس یا ویدیو همراه با متن ارسال کنید.")
-
-        except Exception as e:
-            print(f"❌ خطا در ارسال رسانه: {e}")
-            await safe_send(user_id, "⚠️ خطا در ارسال رسانه.")
-
-        scheduled_queue = deque([
-            (msg, time) for msg, time in scheduled_queue if msg.message_id != message.message_id
-        ])
-
-def format_remaining_time(remaining: timedelta) -> str:
-    total_seconds = int(remaining.total_seconds())
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-
-    parts = []
-    if days > 0:
-        parts.append(f"{days} روز")
-    if hours > 0:
-        parts.append(f"{hours} ساعت")
-    if minutes > 0:
-        parts.append(f"{minutes} دقیقه")
-    if seconds > 0 and days == 0:
-        parts.append(f"{seconds} ثانیه")
-
-    return "⏳ حدود " + " و ".join(parts) + " تا ارسال باقی مانده."
-
-async def log_remaining_times():
-    while True:
-        print("📋 وضعیت صف ارسال:")
         now = datetime.now()
-        for msg, scheduled_time in scheduled_queue:
-            remaining = scheduled_time - now
-            if remaining.total_seconds() <= 0:
-                print(f"✅ پیام {msg.message_id} آماده ارسال است.")
-            else:
-                print(f"🕒 پیام {msg.message_id} از کاربر {msg.author.user_id} در {format_remaining_time(remaining)} دیگر ارسال می‌شود.")
-        await asyncio.sleep(180)
+        to_send = [item for item in scheduled_queue if item["time"] <= now]
 
-async def keep_alive():
+        for item in to_send:
+            await safe_send(item["user_id"], f"📩 پیام زمان‌بندی‌شده:\n{item['content']}")
+            scheduled_queue.remove(item)
+
+        await asyncio.sleep(10)  # بررسی هر ۱۰ ثانیه
+
+# اجرای حلقه اصلی
+async def main():
+    asyncio.create_task(scheduler_loop())
+
+    # شبیه‌سازی دریافت پیام‌ها
+    class DummyMessage:
+        def __init__(self, content, user_id):
+            self.content = content
+            self.author = type("Author", (), {"user_id": user_id})
+
+    # تست دستی
+    await on_message(DummyMessage("سلام", "user1"))
+    await on_message(DummyMessage("تغییر زمان 5", "user1"))
+    await on_message(DummyMessage("چطوری؟", "user1"))
+    await on_message(DummyMessage("زمان", "user1"))
+
+    # اجرای دائمی
     while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("http://localhost:" + os.environ.get("PORT", "10000")) as resp:
-                    print(f"🔄 پینگ داخلی: {resp.status}")
-        except Exception as e:
-            print(f"⚠️ خطا در پینگ داخلی: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(1)
 
-if __name__ == "__main__":
-    print("🤖 ربات در حال اجرا...")
-    threading.Thread(target=run_web_server).start()
-    bot.run()
+# شروع برنامه
+asyncio.run(main())
