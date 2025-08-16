@@ -237,3 +237,13 @@ async def keep_alive():
     while True:
         try:
             async with aiohttp.ClientSession() as session:
+                async with session.get("http://localhost:" + os.environ.get("PORT", "10000")) as resp:
+                    print(f"🔄 پینگ داخلی: {resp.status}")
+        except Exception as e:
+            print(f"⚠️ خطا در پینگ داخلی: {e}")
+        await asyncio.sleep(60)
+
+if __name__ == "__main__":
+    print("🤖 ربات در حال اجرا...")
+    threading.Thread(target=run_web_server).start()
+    bot.run()
