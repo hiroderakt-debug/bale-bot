@@ -9,6 +9,7 @@ bot = Bot(token="347447058:s19i9J3UPZLUrprUqrH12UYD1lDGcPPi1ulV9iFL")
 
 send_queue = asyncio.Queue()
 scheduled_queue = deque()
+cancelled_messages = set()
 
 def save_queue_to_file():
     with open("scheduled_queue.json", "w", encoding="utf-8") as f:
@@ -50,6 +51,18 @@ def load_queue_from_file():
     except FileNotFoundError:
         pass
 
+def save_cancelled_to_file():
+    with open("cancelled.json", "w", encoding="utf-8") as f:
+        json.dump(list(cancelled_messages), f)
+
+def load_cancelled_from_file():
+    global cancelled_messages
+    try:
+        with open("cancelled.json", "r", encoding="utf-8") as f:
+            cancelled_messages = set(json.load(f))
+    except FileNotFoundError:
+        pass
+
 async def safe_send(chat_id: int, text: str):
     try:
         await bot.send_message(chat_id=chat_id, text=text)
@@ -60,16 +73,36 @@ async def safe_send(chat_id: int, text: str):
 async def on_ready():
     print("✅ ربات آماده است.")
     load_queue_from_file()
+    load_cancelled_from_file()
     asyncio.create_task(process_queue())
     asyncio.create_task(log_remaining_times())
 
 @bot.event
 async def on_message(message: Message):
+    global scheduled_queue  # ✅ رفع خطای UnboundLocalError
+
     if getattr(message.chat, "type", None) != "private":
         return
     if message.author.username != "heroderact":
         return
 
+    # لغو پیام زمان‌بندی‌شده
+    if message.reply_to_message and message.content.strip().lower() == "لغو":
+        reply_id = message.reply_to_message.message_id
+        for original_msg, _ in scheduled_queue:
+            if original_msg.message_id == reply_id:
+                cancelled_messages.add(reply_id)
+                scheduled_queue = deque([
+                    (msg, time) for msg, time in scheduled_queue if msg.message_id != reply_id
+                ])
+                save_queue_to_file()
+                save_cancelled_to_file()
+                await safe_send(message.author.user_id, "❌ پیام با موفقیت لغو شد و دیگر ارسال نمی‌شود.")
+                return
+        await safe_send(message.author.user_id, "⚠️ این پیام در صف نبود یا قبلاً ارسال شده.")
+        return
+
+    # بررسی زمان باقی‌مانده
     if message.reply_to_message and message.content.strip().lower() == "زمان":
         reply_id = message.reply_to_message.message_id
         for original_msg, scheduled_time in scheduled_queue:
@@ -83,6 +116,7 @@ async def on_message(message: Message):
         await safe_send(message.author.user_id, "❌ این پیام در صف ارسال نیست یا قبلاً ارسال شده.")
         return
 
+    # زمان‌بندی جدید
     if scheduled_queue:
         last_scheduled_time = scheduled_queue[-1][1]
         scheduled_time = last_scheduled_time + timedelta(minutes=20)
@@ -98,6 +132,11 @@ async def process_queue():
 
     while True:
         message = await send_queue.get()
+
+        if message.message_id in cancelled_messages:
+            print(f"🚫 پیام {message.message_id} لغو شده و ارسال نمی‌شود.")
+            continue
+
         user_id = message.author.user_id
         caption = message.content or ""
         media_sent = False
@@ -148,7 +187,6 @@ async def process_queue():
         ])
         save_queue_to_file()
 
-# ⏱ نمایش هوشمند زمان باقی‌مانده
 def format_remaining_time(remaining: timedelta) -> str:
     total_seconds = int(remaining.total_seconds())
     days = total_seconds // 86400
@@ -168,7 +206,6 @@ def format_remaining_time(remaining: timedelta) -> str:
 
     return "⏳ حدود " + " و ".join(parts) + " تا ارسال باقی مانده."
 
-# 🖥 چاپ وضعیت صف هر 3 دقیقه
 async def log_remaining_times():
     while True:
         print("📋 وضعیت صف ارسال:")
