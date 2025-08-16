@@ -1,67 +1,84 @@
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timedelta
 from collections import deque
 from bale import Bot, Message, InputFile
 import bale.error
+import aiohttp
+from fastapi import FastAPI
+import uvicorn
+import threading
 
 bot = Bot(token="347447058:s19i9J3UPZLUrprUqrH12UYD1lDGcPPi1ulV9iFL")
-
 send_queue = asyncio.Queue()
 scheduled_queue = deque()
-cancelled_messages = set()
 
-def save_queue_to_file():
-    with open("scheduled_queue.json", "w", encoding="utf-8") as f:
-        data = [
-            {
-                "message_id": msg.message_id,
-                "user_id": msg.author.user_id,
-                "content": msg.content,
-                "video": msg.video["file_id"] if msg.video else None,
-                "photos": [photo.file_id for photo in msg.photos] if msg.photos else [],
-                "scheduled_time": time.isoformat()
-            }
-            for msg, time in scheduled_queue
-        ]
-        json.dump(data, f)
+# اتصال به دیتابیس
+conn = sqlite3.connect("data.db")
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS scheduled (
+    message_id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    content TEXT,
+    video TEXT,
+    photos TEXT,
+    scheduled_time TEXT
+)
+""")
+conn.commit()
 
-def load_queue_from_file():
-    try:
-        with open("scheduled_queue.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-            for item in data:
-                FakeMessage = type("FakeMessage", (), {})
-                FakeAuthor = type("FakeAuthor", (), {})
-                FakePhoto = type("FakePhoto", (), {})
+# وب‌سرور FastAPI
+app = FastAPI()
 
-                msg = FakeMessage()
-                msg.message_id = item["message_id"]
-                msg.content = item["content"]
-                msg.video = {"file_id": item["video"]} if item["video"] else None
-                msg.photos = [FakePhoto() for _ in item["photos"]]
-                for i, pid in enumerate(item["photos"]):
-                    msg.photos[i].file_id = pid
+@app.get("/")
+def ping():
+    return {"status": "ok"}
 
-                msg.author = FakeAuthor()
-                msg.author.user_id = item["user_id"]
+def run_web_server():
+    uvicorn.run(app, host="0.0.0.0", port=10000)
 
-                time = datetime.fromisoformat(item["scheduled_time"])
-                scheduled_queue.append((msg, time))
-    except FileNotFoundError:
-        pass
+def save_message_to_db(message: Message, scheduled_time: datetime):
+    cursor.execute("""
+    INSERT OR REPLACE INTO scheduled (message_id, user_id, content, video, photos, scheduled_time)
+    VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        message.message_id,
+        message.author.user_id,
+        message.content,
+        message.video["file_id"] if message.video else None,
+        json.dumps([photo.file_id for photo in message.photos]) if message.photos else "[]",
+        scheduled_time.isoformat()
+    ))
+    conn.commit()
 
-def save_cancelled_to_file():
-    with open("cancelled.json", "w", encoding="utf-8") as f:
-        json.dump(list(cancelled_messages), f)
+def delete_message_from_db(message_id: int):
+    cursor.execute("DELETE FROM scheduled WHERE message_id = ?", (message_id,))
+    conn.commit()
 
-def load_cancelled_from_file():
-    global cancelled_messages
-    try:
-        with open("cancelled.json", "r", encoding="utf-8") as f:
-            cancelled_messages = set(json.load(f))
-    except FileNotFoundError:
-        pass
+def load_queue_from_db():
+    cursor.execute("SELECT * FROM scheduled ORDER BY scheduled_time")
+    rows = cursor.fetchall()
+    for row in rows:
+        FakeMessage = type("FakeMessage", (), {})
+        FakeAuthor = type("FakeAuthor", (), {})
+        FakePhoto = type("FakePhoto", (), {})
+
+        msg = FakeMessage()
+        msg.message_id = row[0]
+        msg.content = row[2]
+        msg.video = {"file_id": row[3]} if row[3] else None
+        photo_ids = json.loads(row[4])
+        msg.photos = [FakePhoto() for _ in photo_ids]
+        for i, pid in enumerate(photo_ids):
+            msg.photos[i].file_id = pid
+
+        msg.author = FakeAuthor()
+        msg.author.user_id = row[1]
+
+        time = datetime.fromisoformat(row[5])
+        scheduled_queue.append((msg, time))
 
 async def safe_send(chat_id: int, text: str):
     try:
@@ -72,37 +89,33 @@ async def safe_send(chat_id: int, text: str):
 @bot.event
 async def on_ready():
     print("✅ ربات آماده است.")
-    load_queue_from_file()
-    load_cancelled_from_file()
+    load_queue_from_db()
     asyncio.create_task(process_queue())
     asyncio.create_task(log_remaining_times())
+    asyncio.create_task(keep_alive())
 
 @bot.event
 async def on_message(message: Message):
-    global scheduled_queue  # ✅ رفع خطای UnboundLocalError
+    global scheduled_queue
 
     if getattr(message.chat, "type", None) != "private":
         return
     if message.author.username != "heroderact":
         return
 
-    # لغو پیام زمان‌بندی‌شده
     if message.reply_to_message and message.content.strip().lower() == "لغو":
         reply_id = message.reply_to_message.message_id
         for original_msg, _ in scheduled_queue:
             if original_msg.message_id == reply_id:
-                cancelled_messages.add(reply_id)
                 scheduled_queue = deque([
                     (msg, time) for msg, time in scheduled_queue if msg.message_id != reply_id
                 ])
-                save_queue_to_file()
-                save_cancelled_to_file()
+                delete_message_from_db(reply_id)
                 await safe_send(message.author.user_id, "❌ پیام با موفقیت لغو شد و دیگر ارسال نمی‌شود.")
                 return
         await safe_send(message.author.user_id, "⚠️ این پیام در صف نبود یا قبلاً ارسال شده.")
         return
 
-    # بررسی زمان باقی‌مانده
     if message.reply_to_message and message.content.strip().lower() == "زمان":
         reply_id = message.reply_to_message.message_id
         for original_msg, scheduled_time in scheduled_queue:
@@ -116,7 +129,13 @@ async def on_message(message: Message):
         await safe_send(message.author.user_id, "❌ این پیام در صف ارسال نیست یا قبلاً ارسال شده.")
         return
 
-    # زمان‌بندی جدید
+    if message.content.strip().lower() == "حذف":
+        scheduled_queue.clear()
+        cursor.execute("DELETE FROM scheduled")
+        conn.commit()
+        await safe_send(message.author.user_id, "🗑️ کل صف زمان‌بندی‌شده با موفقیت حذف شد.")
+        return
+
     if scheduled_queue:
         last_scheduled_time = scheduled_queue[-1][1]
         scheduled_time = last_scheduled_time + timedelta(minutes=20)
@@ -125,17 +144,13 @@ async def on_message(message: Message):
 
     scheduled_queue.append((message, scheduled_time))
     await send_queue.put(message)
-    save_queue_to_file()
+    save_message_to_db(message, scheduled_time)
 
 async def process_queue():
     global scheduled_queue
 
     while True:
         message = await send_queue.get()
-
-        if message.message_id in cancelled_messages:
-            print(f"🚫 پیام {message.message_id} لغو شده و ارسال نمی‌شود.")
-            continue
 
         user_id = message.author.user_id
         caption = message.content or ""
@@ -185,7 +200,7 @@ async def process_queue():
         scheduled_queue = deque([
             (msg, time) for msg, time in scheduled_queue if msg.message_id != message.message_id
         ])
-        save_queue_to_file()
+        delete_message_from_db(message.message_id)
 
 def format_remaining_time(remaining: timedelta) -> str:
     total_seconds = int(remaining.total_seconds())
@@ -218,6 +233,15 @@ async def log_remaining_times():
                 print(f"🕒 پیام {msg.message_id} از کاربر {msg.author.user_id} در {format_remaining_time(remaining)} دیگر ارسال می‌شود.")
         await asyncio.sleep(180)
 
+async def keep_alive():
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("http://localhost:10000") as resp:
+                    print(f"🔄 پینگ داخلی: {resp.status}")
+        except Exception as e:
+            print(f"⚠️ خطا در پینگ داخلی: {e}")
+        await asyncio.sleep(60)
+
 if __name__ == "__main__":
-    print("🤖 ربات در حال اجرا و فقط به پیام‌های شخصی از @heroderact پاسخ می‌دهد...")
-    bot.run()
+    print("
