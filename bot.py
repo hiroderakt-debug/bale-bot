@@ -238,7 +238,8 @@ async def keep_alive():
                     print(f"🔄 پینگ داخلی: {resp.status}")
         except Exception as e:
             print(f"⚠️ خطا در پینگ داخلی: {e}")
-                await asyncio.sleep(60)
+        
+        await asyncio.sleep(20*60)  # ← این خط باید دقیقاً در این سطح باشد
 
 if __name__ == "__main__":
     print("🤖 ربات در حال اجرا...")
