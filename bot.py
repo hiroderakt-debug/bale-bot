@@ -13,6 +13,7 @@ import threading
 delay_minutes = 20
 paused = False
 edit_mode = {}  # user_id -> message_id در حال ویرایش
+cancelled_messages = set()  # برای پیگیری پیام‌های لغو شده
 
 bot = Bot(token="347447058:s19i9J3UPZLUrprUqrH12UYD1lDGcPPi1ulV9iFL")
 send_queue = asyncio.Queue()
@@ -44,7 +45,7 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: Message):
-    global scheduled_queue, delay_minutes, paused, edit_mode
+    global scheduled_queue, delay_minutes, paused, edit_mode, cancelled_messages
 
     if getattr(message.chat, "type", None) != "private":
         return
@@ -82,6 +83,9 @@ async def on_message(message: Message):
     # لغو پیام
     if message.reply_to_message and content.lower() == "لغو":
         reply_id = message.reply_to_message.message_id
+        # اضافه کردن به لیست پیام‌های لغو شده
+        cancelled_messages.add(reply_id)
+        # حذف از صف زمان‌بندی شده
         scheduled_queue = deque([
             (msg, time, caption) for msg, time, caption in scheduled_queue if msg.message_id != reply_id
         ])
@@ -104,6 +108,9 @@ async def on_message(message: Message):
 
     # حذف کل صف
     if content.lower() == "حذف":
+        # اضافه کردن همه پیام‌های صف به لیست لغو شده
+        for msg, _, _ in scheduled_queue:
+            cancelled_messages.add(msg.message_id)
         scheduled_queue.clear()
         await safe_send(user_id, "🗑️ کل صف حذف شد.")
         return
@@ -143,13 +150,15 @@ async def on_message(message: Message):
     await send_queue.put(message)
 
 async def process_queue():
-    global scheduled_queue, paused
+    global scheduled_queue, paused, cancelled_messages
 
     while True:
         message = await send_queue.get()
-
-        while paused:
-            await asyncio.sleep(5)
+        
+        # بررسی لغو پیام قبل از پردازش
+        if message.message_id in cancelled_messages:
+            cancelled_messages.discard(message.message_id)
+            continue
 
         user_id = message.author.user_id
 
@@ -165,36 +174,55 @@ async def process_queue():
         if scheduled_time:
             now = datetime.now()
             wait_seconds = (scheduled_time - now).total_seconds()
+            
+            # اگر پیام لغو شده باشد، منتظر نمان
             if wait_seconds > 0:
-                await asyncio.sleep(wait_seconds)
+                while wait_seconds > 0 and not paused and message.message_id not in cancelled_messages:
+                    await asyncio.sleep(min(5, wait_seconds))  # هر 5 ثانیه چک کنیم
+                    now = datetime.now()
+                    wait_seconds = (scheduled_time - now).total_seconds()
+                
+                # اگر پیام لغو شده باشد، پردازش نکن
+                if message.message_id in cancelled_messages:
+                    cancelled_messages.discard(message.message_id)
+                    continue
 
-        try:
-            if isinstance(message.video, dict) and "file_id" in message.video:
-                await bot.send_video(
-                    chat_id="@hiromce",
-                    video=InputFile(message.video["file_id"]),
-                    caption=caption
-                )
-                print(f"✅ ویدیو از کاربر {user_id} ارسال شد: {datetime.now()}")
-                await safe_send(user_id, "🎥 ویدیو با موفقیت ارسال شد.")
-
-            elif isinstance(message.photos, list) and len(message.photos) > 0:
-                for photo in message.photos:
-                    await bot.send_photo(
+        # اگر pause فعال باشد، منتظر بمان
+        while paused:
+            await asyncio.sleep(5)
+            # اگر پیام لغو شده باشد، پردازش نکن
+            if message.message_id in cancelled_messages:
+                cancelled_messages.discard(message.message_id)
+                break
+        else:  # فقط اگر pause نباشد و پیام لغو نشده باشد ادامه بده
+            try:
+                if isinstance(message.video, dict) and "file_id" in message.video:
+                    await bot.send_video(
                         chat_id="@hiromce",
-                        photo=InputFile(photo.file_id),
+                        video=InputFile(message.video["file_id"]),
                         caption=caption
                     )
-                    print(f"✅ عکس از کاربر {user_id} ارسال شد: {datetime.now()}")
-                    await safe_send(user_id, "🖼️ عکس با موفقیت ارسال شد.")
+                    print(f"✅ ویدیو از کاربر {user_id} ارسال شد: {datetime.now()}")
+                    await safe_send(user_id, "🎥 ویدیو با موفقیت ارسال شد.")
 
-            else:
-                await safe_send(user_id, "⚠️ لطفاً فقط عکس یا ویدیو همراه با متن ارسال کنید.")
+                elif isinstance(message.photos, list) and len(message.photos) > 0:
+                    for photo in message.photos:
+                        await bot.send_photo(
+                            chat_id="@hiromce",
+                            photo=InputFile(photo.file_id),
+                            caption=caption
+                        )
+                        print(f"✅ عکس از کاربر {user_id} ارسال شد: {datetime.now()}")
+                        await safe_send(user_id, "🖼️ عکس با موفقیت ارسال شد.")
 
-        except Exception as e:
-            print(f"❌ خطا در ارسال رسانه: {e}")
-            await safe_send(user_id, "⚠️ خطا در ارسال رسانه.")
+                else:
+                    await safe_send(user_id, "⚠️ لطفاً فقط عکس یا ویدیو همراه با متن ارسال کنید.")
 
+            except Exception as e:
+                print(f"❌ خطا در ارسال رسانه: {e}")
+                await safe_send(user_id, "⚠️ خطا در ارسال رسانه.")
+
+        # حذف پیام از صف بدون توجه به اینکه ارسال شده یا نه
         scheduled_queue = deque([
             (msg, time, cap) for msg, time, cap in scheduled_queue if msg.message_id != message.message_id
         ])
@@ -239,7 +267,7 @@ async def keep_alive():
         except Exception as e:
             print(f"⚠️ خطا در پینگ داخلی: {e}")
         
-        await asyncio.sleep(20*60)  # ← این خط باید دقیقاً در این سطح باشد
+        await asyncio.sleep(20*60)
 
 if __name__ == "__main__":
     print("🤖 ربات در حال اجرا...")
