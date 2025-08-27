@@ -17,7 +17,7 @@ cancelled_messages = set()  # برای پیگیری پیام‌های لغو ش�
 
 bot = Bot(token="347447058:s19i9J3UPZLUrprUqrH12UYD1lDGcPPi1ulV9iFL")
 send_queue = asyncio.Queue()
-scheduled_queue = deque()  # هر آیتم: (message, scheduled_time, caption)
+scheduled_queue = deque()  # هر آیتم: (message, scheduled_time, caption, remaining_seconds)
 
 # وب‌سرور FastAPI
 app = FastAPI()
@@ -58,9 +58,9 @@ async def on_message(message: Message):
     # حالت ویرایش متن
     if user_id in edit_mode:
         target_id = edit_mode[user_id]
-        for i, (msg, time, caption) in enumerate(scheduled_queue):
+        for i, (msg, time, caption, remaining) in enumerate(scheduled_queue):
             if msg.message_id == target_id:
-                scheduled_queue[i] = (msg, time, content)
+                scheduled_queue[i] = (msg, time, content, remaining)
                 await safe_send(user_id, "✏️ متن پیام با موفقیت ویرایش شد.")
                 del edit_mode[user_id]
                 return
@@ -71,12 +71,24 @@ async def on_message(message: Message):
     # توقف ارسال‌ها
     if content.lower() == "توقف":
         paused = True
+        # ذخیره زمان باقیمانده برای همه پیام‌ها
+        now = datetime.now()
+        for i, (msg, scheduled_time, caption, _) in enumerate(scheduled_queue):
+            remaining_seconds = (scheduled_time - now).total_seconds()
+            if remaining_seconds > 0:
+                scheduled_queue[i] = (msg, scheduled_time, caption, remaining_seconds)
         await safe_send(user_id, "⛔ ارسال پیام‌ها متوقف شد.")
         return
 
     # ادامه ارسال‌ها
     if content.lower() == "ادامه":
         paused = False
+        # به روزرسانی زمان‌های برنامه‌ریزی شده با زمان باقیمانده ذخیره شده
+        now = datetime.now()
+        for i, (msg, old_time, caption, remaining_seconds) in enumerate(scheduled_queue):
+            if remaining_seconds is not None and remaining_seconds > 0:
+                new_time = now + timedelta(seconds=remaining_seconds)
+                scheduled_queue[i] = (msg, new_time, caption, None)
         await safe_send(user_id, "▶️ ارسال پیام‌ها ادامه پیدا می‌کند.")
         return
 
@@ -87,7 +99,7 @@ async def on_message(message: Message):
         cancelled_messages.add(reply_id)
         # حذف از صف زمان‌بندی شده
         scheduled_queue = deque([
-            (msg, time, caption) for msg, time, caption in scheduled_queue if msg.message_id != reply_id
+            (msg, time, caption, remaining) for msg, time, caption, remaining in scheduled_queue if msg.message_id != reply_id
         ])
         await safe_send(user_id, "❌ پیام با موفقیت لغو شد.")
         return
@@ -95,13 +107,19 @@ async def on_message(message: Message):
     # نمایش زمان باقی‌مانده
     if message.reply_to_message and content.lower() == "زمان":
         reply_id = message.reply_to_message.message_id
-        for msg, scheduled_time, _ in scheduled_queue:
+        for msg, scheduled_time, _, remaining_seconds in scheduled_queue:
             if msg.message_id == reply_id:
-                remaining = scheduled_time - datetime.now()
-                if remaining.total_seconds() > 0:
-                    await safe_send(user_id, format_remaining_time(remaining))
+                if paused and remaining_seconds is not None:
+                    # هنگام توقف، زمان باقیمانده ثابت است
+                    remaining = timedelta(seconds=remaining_seconds)
+                    await safe_send(user_id, f"⏸️ زمان باقیمانده (متوقف شده): {format_remaining_time(remaining)}")
                 else:
-                    await safe_send(user_id, "✅ این رسانه در حال ارسال یا ارسال شده است.")
+                    # هنگام اجرا، زمان باقیمانده محاسبه می‌شود
+                    remaining = scheduled_time - datetime.now()
+                    if remaining.total_seconds() > 0:
+                        await safe_send(user_id, format_remaining_time(remaining))
+                    else:
+                        await safe_send(user_id, "✅ این رسانه در حال ارسال یا ارسال شده است.")
                 return
         await safe_send(user_id, "❌ این پیام در صف ارسال نیست یا قبلاً ارسال شده.")
         return
@@ -109,7 +127,7 @@ async def on_message(message: Message):
     # حذف کل صف
     if content.lower() == "حذف":
         # اضافه کردن همه پیام‌های صف به لیست لغو شده
-        for msg, _, _ in scheduled_queue:
+        for msg, _, _, _ in scheduled_queue:
             cancelled_messages.add(msg.message_id)
         scheduled_queue.clear()
         await safe_send(user_id, "🗑️ کل صف حذف شد.")
@@ -131,7 +149,7 @@ async def on_message(message: Message):
     # ویرایش متن پیام
     if message.reply_to_message and content.lower() == "ویرایش":
         reply_id = message.reply_to_message.message_id
-        for msg, _, _ in scheduled_queue:
+        for msg, _, _, _ in scheduled_queue:
             if msg.message_id == reply_id:
                 edit_mode[user_id] = reply_id
                 await safe_send(user_id, "📝 لطفاً متن جدید را ارسال کنید.")
@@ -146,7 +164,7 @@ async def on_message(message: Message):
     else:
         scheduled_time = datetime.now() + timedelta(minutes=delay_minutes)
 
-    scheduled_queue.append((message, scheduled_time, content))
+    scheduled_queue.append((message, scheduled_time, content, None))
     await send_queue.put(message)
 
 async def process_queue():
@@ -162,25 +180,49 @@ async def process_queue():
 
         user_id = message.author.user_id
 
-        # پیدا کردن caption مربوط به پیام
+        # پیدا کردن اطلاعات مربوط به پیام
         caption = ""
         scheduled_time = None
-        for msg, time, cap in scheduled_queue:
+        remaining_seconds = None
+        for msg, time, cap, rem in scheduled_queue:
             if msg.message_id == message.message_id:
                 scheduled_time = time
                 caption = cap
+                remaining_seconds = rem
                 break
 
         if scheduled_time:
             now = datetime.now()
-            wait_seconds = (scheduled_time - now).total_seconds()
+            
+            if remaining_seconds is not None and paused:
+                # اگر توقف فعال است و زمان باقیمانده ذخیره شده است
+                wait_seconds = remaining_seconds
+            else:
+                # محاسبه زمان باقیمانده معمولی
+                wait_seconds = (scheduled_time - now).total_seconds()
             
             # اگر پیام لغو شده باشد، منتظر نمان
             if wait_seconds > 0:
-                while wait_seconds > 0 and not paused and message.message_id not in cancelled_messages:
-                    await asyncio.sleep(min(5, wait_seconds))  # هر 5 ثانیه چک کنیم
-                    now = datetime.now()
-                    wait_seconds = (scheduled_time - now).total_seconds()
+                while wait_seconds > 0 and message.message_id not in cancelled_messages:
+                    # چک کردن وضعیت توقف هر 1 ثانیه
+                    await asyncio.sleep(min(1, wait_seconds))
+                    
+                    if paused:
+                        # اگر توقف فعال است، زمان باقیمانده را ذخیره و منتظر بمان
+                        for i, (msg, time, cap, rem) in enumerate(scheduled_queue):
+                            if msg.message_id == message.message_id:
+                                scheduled_queue[i] = (msg, time, cap, wait_seconds)
+                                break
+                        # منتظر بمان تا توقف غیرفعال شود
+                        while paused and message.message_id not in cancelled_messages:
+                            await asyncio.sleep(1)
+                        # اگر پیام لغو شده باشد، پردازش نکن
+                        if message.message_id in cancelled_messages:
+                            break
+                    else:
+                        # کاهش زمان باقیمانده
+                        now = datetime.now()
+                        wait_seconds = (scheduled_time - now).total_seconds()
                 
                 # اگر پیام لغو شده باشد، پردازش نکن
                 if message.message_id in cancelled_messages:
@@ -188,43 +230,45 @@ async def process_queue():
                     continue
 
         # اگر pause فعال باشد، منتظر بمان
-        while paused:
-            await asyncio.sleep(5)
-            # اگر پیام لغو شده باشد، پردازش نکن
-            if message.message_id in cancelled_messages:
-                cancelled_messages.discard(message.message_id)
-                break
-        else:  # فقط اگر pause نباشد و پیام لغو نشده باشد ادامه بده
-            try:
-                if isinstance(message.video, dict) and "file_id" in message.video:
-                    await bot.send_video(
+        while paused and message.message_id not in cancelled_messages:
+            await asyncio.sleep(1)
+        
+        # اگر پیام لغو شده باشد، پردازش نکن
+        if message.message_id in cancelled_messages:
+            cancelled_messages.discard(message.message_id)
+            continue
+            
+        # ارسال پیام
+        try:
+            if isinstance(message.video, dict) and "file_id" in message.video:
+                await bot.send_video(
+                    chat_id="@hiromce",
+                    video=InputFile(message.video["file_id"]),
+                    caption=caption
+                )
+                print(f"✅ ویدیو از کاربر {user_id} ارسال شد: {datetime.now()}")
+                await safe_send(user_id, "🎥 ویدیو با موفقیت ارسال شد.")
+
+            elif isinstance(message.photos, list) and len(message.photos) > 0:
+                for photo in message.photos:
+                    await bot.send_photo(
                         chat_id="@hiromce",
-                        video=InputFile(message.video["file_id"]),
+                        photo=InputFile(photo.file_id),
                         caption=caption
                     )
-                    print(f"✅ ویدیو از کاربر {user_id} ارسال شد: {datetime.now()}")
-                    await safe_send(user_id, "🎥 ویدیو با موفقیت ارسال شد.")
+                print(f"✅ عکس از کاربر {user_id} ارسال شد: {datetime.now()}")
+                await safe_send(user_id, "🖼️ عکس با موفقیت ارسال شد.")
 
-                elif isinstance(message.photos, list) and len(message.photos) > 0:
-                    for photo in message.photos:
-                        await bot.send_photo(
-                            chat_id="@hiromce",
-                            photo=InputFile(photo.file_id),
-                            caption=caption
-                        )
-                        print(f"✅ عکس از کاربر {user_id} ارسال شد: {datetime.now()}")
-                        await safe_send(user_id, "🖼️ عکس با موفقیت ارسال شد.")
+            else:
+                await safe_send(user_id, "⚠️ لطفاً فقط عکس یا ویدیو همراه با متن ارسال کنید.")
 
-                else:
-                    await safe_send(user_id, "⚠️ لطفاً فقط عکس یا ویدیو همراه با متن ارسال کنید.")
-
-            except Exception as e:
-                print(f"❌ خطا در ارسال رسانه: {e}")
-                await safe_send(user_id, "⚠️ خطا در ارسال رسانه.")
+        except Exception as e:
+            print(f"❌ خطا در ارسال رسانه: {e}")
+            await safe_send(user_id, "⚠️ خطا در ارسال رسانه.")
 
         # حذف پیام از صف بدون توجه به اینکه ارسال شده یا نه
         scheduled_queue = deque([
-            (msg, time, cap) for msg, time, cap in scheduled_queue if msg.message_id != message.message_id
+            (msg, time, cap, rem) for msg, time, cap, rem in scheduled_queue if msg.message_id != message.message_id
         ])
 
 def format_remaining_time(remaining: timedelta) -> str:
@@ -250,12 +294,15 @@ async def log_remaining_times():
     while True:
         print("📋 وضعیت صف ارسال:")
         now = datetime.now()
-        for msg, scheduled_time, _ in scheduled_queue:
-            remaining = scheduled_time - now
-            if remaining.total_seconds() <= 0:
-                print(f"✅ پیام {msg.message_id} آماده ارسال است.")
+        for msg, scheduled_time, _, remaining_seconds in scheduled_queue:
+            if paused and remaining_seconds is not None:
+                print(f"⏸️ پیام {msg.message_id} از کاربر {msg.author.user_id} متوقف شده است. زمان باقیمانده: {remaining_seconds} ثانیه")
             else:
-                print(f"🕒 پیام {msg.message_id} از کاربر {msg.author.user_id} در {format_remaining_time(remaining)} دیگر ارسال می‌شود.")
+                remaining = scheduled_time - now
+                if remaining.total_seconds() <= 0:
+                    print(f"✅ پیام {msg.message_id} آماده ارسال است.")
+                else:
+                    print(f"🕒 پیام {msg.message_id} از کاربر {msg.author.user_id} در {format_remaining_time(remaining)} دیگر ارسال می‌شود.")
         await asyncio.sleep(180)
 
 async def keep_alive():
