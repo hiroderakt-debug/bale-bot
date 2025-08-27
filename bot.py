@@ -8,6 +8,8 @@ import aiohttp
 from fastapi import FastAPI
 import uvicorn
 import threading
+import time
+import re
 
 # تنظیمات اولیه
 delay_minutes = 20
@@ -18,6 +20,8 @@ cancelled_messages = set()  # برای پیگیری پیام‌های لغو ش�
 bot = Bot(token="347447058:s19i9J3UPZLUrprUqrH12UYD1lDGcPPi1ulV9iFL")
 send_queue = asyncio.Queue()
 scheduled_queue = deque()  # هر آیتم: (message, scheduled_time, caption, remaining_seconds)
+sent_messages = {}  # message_id: {"bale_message_id": xxx, "chat_id": "@hiromce", "views_threshold": None}
+special_ads = {}  # برای تبلیغات ویژه: message_id -> {"times": 5, "sent_count": 0, "original_message": message, "forwarded_messages": []}
 
 # وب‌سرور FastAPI
 app = FastAPI()
@@ -36,19 +40,33 @@ async def safe_send(chat_id: int, text: str):
     except bale.error.Forbidden:
         print(f"❌ ارسال پیام به کاربر {chat_id} ممکن نیست.")
 
+async def safe_delete(chat_id: str, message_id: int):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception as e:
+        print(f"❌ خطا در حذف پیام: {e}")
+        return False
+
 @bot.event
 async def on_ready():
     print("✅ ربات آماده است.")
     asyncio.create_task(process_queue())
     asyncio.create_task(log_remaining_times())
     asyncio.create_task(keep_alive())
+    asyncio.create_task(monitor_views())  # مانیتورینگ ویوها
+    asyncio.create_task(process_special_ads())  # پردازش تبلیغات ویژه
 
 @bot.event
 async def on_message(message: Message):
     global scheduled_queue, delay_minutes, paused, edit_mode, cancelled_messages
 
     if getattr(message.chat, "type", None) != "private":
+        # بررسی دستورات ویو در چنل (فقط ویو، لغو ویو حذف شد)
+        if message.chat.type == "channel" and message.chat.username == "hiromce":
+            await handle_view_commands(message)
         return
+        
     if message.author.username != "heroderact":
         return
 
@@ -157,6 +175,42 @@ async def on_message(message: Message):
         await safe_send(user_id, "⚠️ این پیام در صف نیست یا قبلاً ارسال شده.")
         return
 
+    # لغو ویو (حذف خودکار) - فقط در چت خصوصی
+    if message.reply_to_message and content.lower() == "لغو ویو":
+        reply_id = message.reply_to_message.message_id
+        if reply_id in sent_messages:
+            sent_messages[reply_id]["views_threshold"] = None
+            await safe_send(user_id, "✅ تنظیمات حذف خودکار لغو شد.")
+        else:
+            await safe_send(user_id, "⚠️ این پیام پیدا نشد یا قبلاً حذف شده است.")
+        return
+
+    # تبلیغ ویژه (ارسال خودکار در ساعت ۱۲ شب)
+    if message.reply_to_message and content.lower().startswith("تبلیغ ویژه"):
+        reply_id = message.reply_to_message.message_id
+        
+        # استخراج تعداد دفعات از پیام
+        times = 5  # مقدار پیش‌فرض
+        parts = content.split()
+        if len(parts) >= 3:
+            try:
+                times = int(parts[2])
+            except ValueError:
+                await safe_send(user_id, "⚠️ لطفاً عدد معتبر وارد کنید. مثال: تبلیغ ویژه 3")
+                return
+        
+        # ذخیره پیام برای ارسال خودکار
+        special_ads[reply_id] = {
+            "times": times,
+            "sent_count": 0,
+            "original_message": message.reply_to_message,
+            "caption": message.reply_to_message.content or "",
+            "forwarded_messages": []  # لیست پیام‌های فوروارد شده
+        }
+        
+        await safe_send(user_id, f"✅ تبلیغ ویژه تنظیم شد. این پیام {times} بار هر شب ساعت ۱۲ فوروارد خواهد شد و در پایان همه پیام‌ها (اصلی و فورواردها) حذف خواهند شد.")
+        return
+
     # زمان‌بندی پیام جدید
     if scheduled_queue:
         last_scheduled_time = scheduled_queue[-1][1]
@@ -166,6 +220,103 @@ async def on_message(message: Message):
 
     scheduled_queue.append((message, scheduled_time, content, None))
     await send_queue.put(message)
+
+async def handle_view_commands(message: Message):
+    """مدیریت دستورات ویو در چنل (فقط دستور ویو، لغو ویو حذف شد)"""
+    if not message.reply_to_message:
+        return
+        
+    content = message.content.strip().lower()
+    reply_id = message.reply_to_message.message_id
+    
+    if content.startswith("ویو"):
+        try:
+            # استخراج عدد از دستور (مثلاً "ویو 100")
+            parts = content.split()
+            if len(parts) >= 2:
+                views_threshold = int(parts[1])
+                
+                # ذخیره تنظیمات حذف خودکار
+                if reply_id in sent_messages:
+                    sent_messages[reply_id]["views_threshold"] = views_threshold
+                    await safe_delete(message.chat.id, message.message_id)  # حذف دستور ویو
+                    await bot.send_message(chat_id=message.author.user_id, 
+                                         text=f"✅ پست بعد از رسیدن به {views_threshold} ویو حذف خواهد شد.")
+                else:
+                    await safe_delete(message.chat.id, message.message_id)  # حذف دستور ویو
+                    await bot.send_message(chat_id=message.author.user_id, 
+                                         text="⚠️ پیام موردنظر پیدا نشد.")
+        except ValueError:
+            await safe_delete(message.chat.id, message.message_id)  # حذف دستور ویو
+            await bot.send_message(chat_id=message.author.user_id, 
+                                 text="⚠️ لطفاً عدد معتبر وارد کنید. مثال: ویو 100")
+
+async def process_special_ads():
+    """پردازش تبلیغات ویژه و فوروارد خودکار در ساعت ۱۲ شب"""
+    while True:
+        try:
+            now = datetime.now()
+            
+            # بررسی اگر ساعت ۱۲ شب است
+            if now.hour == 0 and now.minute == 0:
+                ads_to_remove = []
+                
+                for msg_id, ad_info in list(special_ads.items()):
+                    if ad_info["sent_count"] < ad_info["times"]:
+                        try:
+                            # فوروارد پیام از چنل
+                            forwarded_msg = await bot.forward_message(
+                                chat_id="@hiromce",
+                                from_chat_id="@hiromce",
+                                message_id=msg_id
+                            )
+                            
+                            # ذخیره پیام فوروارد شده برای حذف بعدی
+                            ad_info["forwarded_messages"].append(forwarded_msg.message_id)
+                            ad_info["sent_count"] += 1
+                            
+                            print(f"✅ تبلیغ ویژه فوروارد شد ({ad_info['sent_count']}/{ad_info['times']})")
+                            
+                        except Exception as e:
+                            print(f"❌ خطا در فوروارد تبلیغ ویژه: {e}")
+                    
+                    # اگر تعداد ارسال‌ها کامل شده، حذف همه پیام‌های فوروارد شده و پیام اصلی
+                    if ad_info["sent_count"] >= ad_info["times"]:
+                        # حذف همه پیام‌های فوروارد شده
+                        for fwd_msg_id in ad_info["forwarded_messages"]:
+                            try:
+                                await safe_delete("@hiromce", fwd_msg_id)
+                                print(f"✅ پیام فوروارد شده حذف شد: {fwd_msg_id}")
+                            except Exception as e:
+                                print(f"❌ خطا در حذف پیام فوروارد شده: {e}")
+                        
+                        # حذف پیام اصلی
+                        try:
+                            await safe_delete("@hiromce", msg_id)
+                            print(f"✅ پیام اصلی حذف شد: {msg_id}")
+                        except Exception as e:
+                            print(f"❌ خطا در حذف پیام اصلی: {e}")
+                        
+                        # اطلاع به کاربر
+                        try:
+                            await safe_send(ad_info["original_message"].author.user_id, 
+                                          f"✅ تبلیغ ویژه کامل شد. همه پیام‌ها (اصلی و فورواردها) حذف شدند.")
+                        except:
+                            pass
+                        
+                        ads_to_remove.append(msg_id)
+                        print(f"✅ تبلیغ ویژه کامل شد و همه پیام‌ها حذف شدند.")
+                
+                # حذف تبلیغات کامل شده
+                for msg_id in ads_to_remove:
+                    if msg_id in special_ads:
+                        del special_ads[msg_id]
+        
+        except Exception as e:
+            print(f"❌ خطا در پردازش تبلیغات ویژه: {e}")
+        
+        # چک کردن هر دقیقه
+        await asyncio.sleep(60)
 
 async def process_queue():
     global scheduled_queue, paused, cancelled_messages
@@ -320,3 +471,4 @@ if __name__ == "__main__":
     print("🤖 ربات در حال اجرا...")
     threading.Thread(target=run_web_server).start()
     bot.run()
+
